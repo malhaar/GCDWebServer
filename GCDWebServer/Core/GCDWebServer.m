@@ -42,6 +42,15 @@
 
 #import "GCDWebServerPrivate.h"
 
+#if defined(__has_include) && __has_include(<openssl/ssl.h>)
+#define GCDWEBSERVER_USE_OPENSSL 1
+#import <openssl/ssl.h>
+#import <openssl/err.h>
+#import <openssl/pkcs12.h>
+#else
+#define GCDWEBSERVER_USE_OPENSSL 0
+#endif
+
 #if TARGET_OS_IPHONE && !TARGET_IPHONE_SIMULATOR
 #define kDefaultPort 80
 #else
@@ -68,6 +77,11 @@ NSString* const GCDWebServerOption_DispatchQueuePriority = @"DispatchQueuePriori
 #if TARGET_OS_IPHONE
 NSString* const GCDWebServerOption_AutomaticallySuspendInBackground = @"AutomaticallySuspendInBackground";
 #endif
+
+NSString* const GCDWebServerOption_TLSCertificateFile = @"TLSCertificateFile";
+NSString* const GCDWebServerOption_TLSPrivateKeyFile = @"TLSPrivateKeyFile";
+NSString* const GCDWebServerOption_TLSPKCS12File = @"TLSPKCS12File";
+NSString* const GCDWebServerOption_TLSPKCS12Password = @"TLSPKCS12Password";
 
 NSString* const GCDWebServerAuthenticationMethod_Basic = @"Basic";
 NSString* const GCDWebServerAuthenticationMethod_DigestAccess = @"DigestAccess";
@@ -174,6 +188,10 @@ static void _ExecuteMainThreadRunLoopSources() {
 #endif
 #ifdef __GCDWEBSERVER_ENABLE_TESTING__
   BOOL _recording;
+#endif
+#if GCDWEBSERVER_USE_OPENSSL
+  SSL_CTX* _sslContext;
+  BOOL _tlsEnabled;
 #endif
 }
 
@@ -576,13 +594,98 @@ static inline NSString* _EncodeBase64(NSString* string) {
   _disconnectDelay = [(NSNumber*)_GetOption(_options, GCDWebServerOption_ConnectedStateCoalescingInterval, @1.0) doubleValue];
   _dispatchQueuePriority = [(NSNumber*)_GetOption(_options, GCDWebServerOption_DispatchQueuePriority, @(DISPATCH_QUEUE_PRIORITY_DEFAULT)) longValue];
 
+#if GCDWEBSERVER_USE_OPENSSL
+  NSString* tlsCertFile = _GetOption(_options, GCDWebServerOption_TLSCertificateFile, nil);
+  NSString* tlsKeyFile = _GetOption(_options, GCDWebServerOption_TLSPrivateKeyFile, nil);
+  NSString* tlsP12File = _GetOption(_options, GCDWebServerOption_TLSPKCS12File, nil);
+  NSString* tlsP12Password = _GetOption(_options, GCDWebServerOption_TLSPKCS12Password, nil);
+
+  if (tlsCertFile || tlsP12File) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+      OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+    });
+
+    _sslContext = SSL_CTX_new(TLS_server_method());
+    if (!_sslContext) {
+      if (error) {
+        unsigned long sslErr = ERR_get_error();
+        *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed creating SSL context: %s", ERR_reason_error_string(sslErr)]}];
+      }
+      close(listeningSocket4);
+      close(listeningSocket6);
+      return NO;
+    }
+    SSL_CTX_set_min_proto_version(_sslContext, TLS1_2_VERSION);
+
+    BOOL certLoaded = NO;
+    if (tlsCertFile && tlsKeyFile) {
+      if (SSL_CTX_use_certificate_chain_file(_sslContext, tlsCertFile.fileSystemRepresentation) != 1) {
+        unsigned long sslErr = ERR_get_error();
+        if (error) {
+          *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed loading TLS certificate: %s", ERR_reason_error_string(sslErr)]}];
+        }
+        GWS_LOG_ERROR(@"Failed loading TLS certificate from %@: %s", tlsCertFile, ERR_reason_error_string(sslErr));
+        SSL_CTX_free(_sslContext);
+        _sslContext = NULL;
+        close(listeningSocket4);
+        close(listeningSocket6);
+        return NO;
+      }
+      if (SSL_CTX_use_PrivateKey_file(_sslContext, tlsKeyFile.fileSystemRepresentation, SSL_FILETYPE_PEM) != 1) {
+        unsigned long sslErr = ERR_get_error();
+        if (error) {
+          *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed loading TLS private key: %s", ERR_reason_error_string(sslErr)]}];
+        }
+        GWS_LOG_ERROR(@"Failed loading TLS private key from %@: %s", tlsKeyFile, ERR_reason_error_string(sslErr));
+        SSL_CTX_free(_sslContext);
+        _sslContext = NULL;
+        close(listeningSocket4);
+        close(listeningSocket6);
+        return NO;
+      }
+      certLoaded = YES;
+    } else if (tlsP12File) {
+      if (![self _loadPKCS12:tlsP12File password:tlsP12Password intoContext:_sslContext error:error]) {
+        SSL_CTX_free(_sslContext);
+        _sslContext = NULL;
+        close(listeningSocket4);
+        close(listeningSocket6);
+        return NO;
+      }
+      certLoaded = YES;
+    }
+
+    if (certLoaded && SSL_CTX_check_private_key(_sslContext) != 1) {
+      unsigned long sslErr = ERR_get_error();
+      if (error) {
+        *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"TLS certificate and private key do not match: %s", ERR_reason_error_string(sslErr)]}];
+      }
+      GWS_LOG_ERROR(@"TLS certificate and private key do not match: %s", ERR_reason_error_string(sslErr));
+      SSL_CTX_free(_sslContext);
+      _sslContext = NULL;
+      close(listeningSocket4);
+      close(listeningSocket6);
+      return NO;
+    }
+    _tlsEnabled = YES;
+    GWS_LOG_INFO(@"TLS enabled with %s", tlsCertFile ? "PEM certificate" : "PKCS#12 file");
+  }
+#endif
+
   _source4 = [self _createDispatchSourceWithListeningSocket:listeningSocket4 isIPv6:NO];
   _source6 = [self _createDispatchSourceWithListeningSocket:listeningSocket6 isIPv6:YES];
   _port = port;
   _bindToLocalhost = bindToLocalhost;
 
   NSString* bonjourName = _GetOption(_options, GCDWebServerOption_BonjourName, nil);
-  NSString* bonjourType = _GetOption(_options, GCDWebServerOption_BonjourType, @"_http._tcp");
+  NSString* defaultBonjourType = @"_http._tcp";
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_tlsEnabled) {
+    defaultBonjourType = @"_https._tcp";
+  }
+#endif
+  NSString* bonjourType = _GetOption(_options, GCDWebServerOption_BonjourType, defaultBonjourType);
   if (bonjourName) {
     _registrationService = CFNetServiceCreate(kCFAllocatorDefault, CFSTR("local."), (__bridge CFStringRef)bonjourType, (__bridge CFStringRef)(bonjourName.length ? bonjourName : _serverName), (SInt32)_port);
     if (_registrationService) {
@@ -716,6 +819,14 @@ static inline NSString* _EncodeBase64(NSString* string) {
   _authenticationBasicAccounts = nil;
   _authenticationDigestAccounts = nil;
 
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_sslContext) {
+    SSL_CTX_free(_sslContext);
+    _sslContext = NULL;
+    _tlsEnabled = NO;
+  }
+#endif
+
   dispatch_async(dispatch_get_main_queue(), ^{
     if (self->_disconnectTimer) {
       CFRunLoopTimerInvalidate(self->_disconnectTimer);
@@ -800,6 +911,94 @@ static inline NSString* _EncodeBase64(NSString* string) {
   }
 }
 
+#if GCDWEBSERVER_USE_OPENSSL
+
+- (void*)sslContext {
+  return _sslContext;
+}
+
+- (BOOL)tlsEnabled {
+  return _tlsEnabled;
+}
+
+- (BOOL)_loadPKCS12:(NSString*)path password:(NSString*)password intoContext:(SSL_CTX*)ctx error:(NSError**)error {
+  BIO* bio = BIO_new_file(path.fileSystemRepresentation, "rb");
+  if (!bio) {
+    if (error) {
+      *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed opening PKCS#12 file: %@", path]}];
+    }
+    GWS_LOG_ERROR(@"Failed opening PKCS#12 file: %@", path);
+    return NO;
+  }
+
+  PKCS12* p12 = d2i_PKCS12_bio(bio, NULL);
+  BIO_free(bio);
+  if (!p12) {
+    unsigned long sslErr = ERR_get_error();
+    if (error) {
+      *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed parsing PKCS#12 file: %s", ERR_reason_error_string(sslErr)]}];
+    }
+    GWS_LOG_ERROR(@"Failed parsing PKCS#12 file: %s", ERR_reason_error_string(sslErr));
+    return NO;
+  }
+
+  EVP_PKEY* pkey = NULL;
+  X509* cert = NULL;
+  STACK_OF(X509)* ca = NULL;
+  const char* pass = password ? password.UTF8String : "";
+
+  if (PKCS12_parse(p12, pass, &pkey, &cert, &ca) != 1) {
+    unsigned long sslErr = ERR_get_error();
+    if (error) {
+      *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed parsing PKCS#12 contents (wrong password?): %s", ERR_reason_error_string(sslErr)]}];
+    }
+    GWS_LOG_ERROR(@"Failed parsing PKCS#12 contents: %s", ERR_reason_error_string(sslErr));
+    PKCS12_free(p12);
+    return NO;
+  }
+  PKCS12_free(p12);
+
+  BOOL success = YES;
+  if (SSL_CTX_use_certificate(ctx, cert) != 1) {
+    unsigned long sslErr = ERR_get_error();
+    if (error) {
+      *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed loading certificate from PKCS#12: %s", ERR_reason_error_string(sslErr)]}];
+    }
+    GWS_LOG_ERROR(@"Failed loading certificate from PKCS#12: %s", ERR_reason_error_string(sslErr));
+    success = NO;
+  }
+
+  if (success && SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
+    unsigned long sslErr = ERR_get_error();
+    if (error) {
+      *error = [NSError errorWithDomain:kGCDWebServerErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed loading private key from PKCS#12: %s", ERR_reason_error_string(sslErr)]}];
+    }
+    GWS_LOG_ERROR(@"Failed loading private key from PKCS#12: %s", ERR_reason_error_string(sslErr));
+    success = NO;
+  }
+
+  if (success && ca) {
+    for (int i = 0; i < sk_X509_num(ca); i++) {
+      if (SSL_CTX_add_extra_chain_cert(ctx, X509_dup(sk_X509_value(ca, i))) != 1) {
+        GWS_LOG_WARNING(@"Failed adding chain certificate %i from PKCS#12", i);
+      }
+    }
+  }
+
+  EVP_PKEY_free(pkey);
+  X509_free(cert);
+  sk_X509_pop_free(ca, X509_free);
+  return success;
+}
+
+#else
+
+- (BOOL)tlsEnabled {
+  return NO;
+}
+
+#endif
+
 @end
 
 @implementation GCDWebServer (Extensions)
@@ -808,10 +1007,12 @@ static inline NSString* _EncodeBase64(NSString* string) {
   if (_source4) {
     NSString* ipAddress = _bindToLocalhost ? @"localhost" : GCDWebServerGetPrimaryIPAddress(NO);  // We can't really use IPv6 anyway as it doesn't work great with HTTP URLs in practice
     if (ipAddress) {
-      if (_port != 80) {
-        return [NSURL URLWithString:[NSString stringWithFormat:@"http://%@:%i/", ipAddress, (int)_port]];
+      NSString* scheme = self.tlsEnabled ? @"https" : @"http";
+      NSUInteger defaultPort = self.tlsEnabled ? 443 : 80;
+      if (_port != defaultPort) {
+        return [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@:%i/", scheme, ipAddress, (int)_port]];
       } else {
-        return [NSURL URLWithString:[NSString stringWithFormat:@"http://%@/", ipAddress]];
+        return [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@/", scheme, ipAddress]];
       }
     }
   }
@@ -823,10 +1024,12 @@ static inline NSString* _EncodeBase64(NSString* string) {
     NSString* name = (__bridge NSString*)CFNetServiceGetTargetHost(_resolutionService);
     if (name.length) {
       name = [name substringToIndex:(name.length - 1)];  // Strip trailing period at end of domain
-      if (_port != 80) {
-        return [NSURL URLWithString:[NSString stringWithFormat:@"http://%@:%i/", name, (int)_port]];
+      NSString* scheme = self.tlsEnabled ? @"https" : @"http";
+      NSUInteger defaultPort = self.tlsEnabled ? 443 : 80;
+      if (_port != defaultPort) {
+        return [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@:%i/", scheme, name, (int)_port]];
       } else {
-        return [NSURL URLWithString:[NSString stringWithFormat:@"http://%@/", name]];
+        return [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@/", scheme, name]];
       }
     }
   }
@@ -835,10 +1038,12 @@ static inline NSString* _EncodeBase64(NSString* string) {
 
 - (NSURL*)publicServerURL {
   if (_source4 && _dnsService && _dnsAddress && _dnsPort) {
-    if (_dnsPort != 80) {
-      return [NSURL URLWithString:[NSString stringWithFormat:@"http://%@:%i/", _dnsAddress, (int)_dnsPort]];
+    NSString* scheme = self.tlsEnabled ? @"https" : @"http";
+    NSUInteger defaultPort = self.tlsEnabled ? 443 : 80;
+    if (_dnsPort != defaultPort) {
+      return [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@:%i/", scheme, _dnsAddress, (int)_dnsPort]];
     } else {
-      return [NSURL URLWithString:[NSString stringWithFormat:@"http://%@/", _dnsAddress]];
+      return [NSURL URLWithString:[NSString stringWithFormat:@"%@://%@/", scheme, _dnsAddress]];
     }
   }
   return nil;

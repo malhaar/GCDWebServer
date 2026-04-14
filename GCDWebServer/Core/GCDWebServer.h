@@ -220,6 +220,40 @@ extern NSString* const GCDWebServerOption_AutomaticallySuspendInBackground;
 #endif
 
 /**
+ *  Path to a PEM-encoded TLS certificate file (NSString).
+ *  Must be used together with GCDWebServerOption_TLSPrivateKeyFile.
+ *
+ *  The default value is nil i.e. TLS is disabled.
+ */
+extern NSString* const GCDWebServerOption_TLSCertificateFile;
+
+/**
+ *  Path to a PEM-encoded TLS private key file (NSString).
+ *  Must be used together with GCDWebServerOption_TLSCertificateFile.
+ *
+ *  The default value is nil i.e. TLS is disabled.
+ */
+extern NSString* const GCDWebServerOption_TLSPrivateKeyFile;
+
+/**
+ *  Path to a PKCS#12 (.p12) file containing both the certificate and
+ *  private key (NSString). Alternative to the PEM cert+key pair.
+ *
+ *  To convert PEM cert+key to PKCS#12:
+ *  openssl pkcs12 -export -out cert.p12 -inkey key.pem -in cert.pem
+ *
+ *  The default value is nil i.e. TLS is disabled.
+ */
+extern NSString* const GCDWebServerOption_TLSPKCS12File;
+
+/**
+ *  Passphrase for the PKCS#12 file (NSString).
+ *
+ *  The default value is nil i.e. no passphrase.
+ */
+extern NSString* const GCDWebServerOption_TLSPKCS12Password;
+
+/**
  *  HTTP Basic Authentication scheme (see https://tools.ietf.org/html/rfc2617).
  *
  *  @warning Use of this authentication scheme is not recommended as the
@@ -317,6 +351,13 @@ extern NSString* const GCDWebServerAuthenticationMethod_DigestAccess;
  *  Returns YES if the server is currently running.
  */
 @property(nonatomic, readonly, getter=isRunning) BOOL running;
+
+/**
+ *  Returns YES if the server has TLS enabled.
+ *
+ *  @warning This property is only valid if the server is running.
+ */
+@property(nonatomic, readonly) BOOL tlsEnabled;
 
 /**
  *  Returns the port used by the server.

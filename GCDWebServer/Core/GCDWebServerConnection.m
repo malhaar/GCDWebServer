@@ -37,6 +37,14 @@
 
 #import "GCDWebServerPrivate.h"
 
+#if defined(__has_include) && __has_include(<openssl/ssl.h>)
+#define GCDWEBSERVER_USE_OPENSSL 1
+#import <openssl/ssl.h>
+#import <openssl/err.h>
+#else
+#define GCDWEBSERVER_USE_OPENSSL 0
+#endif
+
 #define kHeadersReadCapacity (1 * 1024)
 #define kBodyReadCapacity (256 * 1024)
 
@@ -86,6 +94,9 @@ NS_ASSUME_NONNULL_END
   NSInteger _statusCode;
 
   BOOL _opened;
+#if GCDWEBSERVER_USE_OPENSSL
+  SSL* _ssl;
+#endif
 #ifdef __GCDWEBSERVER_ENABLE_TESTING__
   NSUInteger _connectionIndex;
   NSString* _requestPath;
@@ -386,6 +397,14 @@ NS_ASSUME_NONNULL_END
 }
 
 - (void)dealloc {
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_ssl && _opened) {
+    SSL_shutdown(_ssl);
+    SSL_free(_ssl);
+    _ssl = NULL;
+  }
+#endif
+
   int result = close(_socket);
   if (result != 0) {
     GWS_LOG_ERROR(@"Failed closing socket %i for connection: %s (%i)", _socket, strerror(errno), errno);
@@ -413,6 +432,34 @@ NS_ASSUME_NONNULL_END
 @implementation GCDWebServerConnection (Read)
 
 - (void)readData:(NSMutableData*)data withLength:(NSUInteger)length completionBlock:(ReadDataCompletionBlock)block {
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_ssl) {
+    dispatch_async(dispatch_get_global_queue(_server.dispatchQueuePriority, 0), ^{
+      @autoreleasepool {
+        uint8_t buffer[16384];
+        int bytesRead = SSL_read(self->_ssl, buffer, (int)MIN(length, sizeof(buffer)));
+        if (bytesRead > 0) {
+          [data appendBytes:buffer length:bytesRead];
+          [self didReadBytes:buffer length:bytesRead];
+          block(YES);
+        } else {
+          int sslError = SSL_get_error(self->_ssl, bytesRead);
+          if (bytesRead == 0) {
+            if (self->_totalBytesRead > 0) {
+              GWS_LOG_ERROR(@"TLS connection closed on socket %i (SSL_error=%i)", self->_socket, sslError);
+            } else {
+              GWS_LOG_WARNING(@"No data received via TLS on socket %i", self->_socket);
+            }
+          } else {
+            GWS_LOG_ERROR(@"TLS read error on socket %i (SSL_error=%i)", self->_socket, sslError);
+          }
+          block(NO);
+        }
+      }
+    });
+    return;
+  }
+#endif
   dispatch_read(_socket, length, dispatch_get_global_queue(_server.dispatchQueuePriority, 0), ^(dispatch_data_t buffer, int error) {
     @autoreleasepool {
       if (error == 0) {
@@ -570,6 +617,34 @@ static inline NSUInteger _ScanHexNumber(const void* bytes, NSUInteger size) {
 @implementation GCDWebServerConnection (Write)
 
 - (void)writeData:(NSData*)data withCompletionBlock:(WriteDataCompletionBlock)block {
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_ssl) {
+    dispatch_async(dispatch_get_global_queue(_server.dispatchQueuePriority, 0), ^{
+      @autoreleasepool {
+        const uint8_t* ptr = (const uint8_t*)data.bytes;
+        NSUInteger remaining = data.length;
+        BOOL success = YES;
+        while (remaining > 0) {
+          int written = SSL_write(self->_ssl, ptr, (int)MIN(remaining, INT_MAX));
+          if (written > 0) {
+            ptr += written;
+            remaining -= written;
+          } else {
+            int sslError = SSL_get_error(self->_ssl, written);
+            GWS_LOG_ERROR(@"TLS write error on socket %i (SSL_error=%i)", self->_socket, sslError);
+            success = NO;
+            break;
+          }
+        }
+        if (success) {
+          [self didWriteBytes:data.bytes length:data.length];
+        }
+        block(success);
+      }
+    });
+    return;
+  }
+#endif
   dispatch_data_t buffer = dispatch_data_create(data.bytes, data.length, dispatch_get_global_queue(_server.dispatchQueuePriority, 0), ^{
     [data self];  // Keeps ARC from releasing data too early
   });
@@ -666,6 +741,27 @@ static inline NSUInteger _ScanHexNumber(const void* bytes, NSUInteger size) {
     _responsePath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSProcessInfo processInfo] globallyUniqueString]];
     _responseFD = open([_responsePath fileSystemRepresentation], O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     GWS_DCHECK(_responseFD > 0);
+  }
+#endif
+
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_server.tlsEnabled) {
+    SSL_CTX* ctx = (SSL_CTX*)_server.sslContext;
+    _ssl = SSL_new(ctx);
+    if (!_ssl) {
+      GWS_LOG_ERROR(@"Failed creating SSL object for socket %i", _socket);
+      return NO;
+    }
+    SSL_set_fd(_ssl, _socket);
+    int ret = SSL_accept(_ssl);
+    if (ret <= 0) {
+      int sslError = SSL_get_error(_ssl, ret);
+      GWS_LOG_ERROR(@"TLS handshake failed on socket %i (SSL_error=%i)", _socket, sslError);
+      SSL_free(_ssl);
+      _ssl = NULL;
+      return NO;
+    }
+    GWS_LOG_DEBUG(@"TLS handshake completed on socket %i (%s)", _socket, SSL_get_version(_ssl));
   }
 #endif
 
@@ -830,6 +926,14 @@ static inline BOOL _CompareResources(NSString* responseETag, NSString* requestET
       GWS_DNOT_REACHED();
     }
     unlink([_responsePath fileSystemRepresentation]);
+  }
+#endif
+
+#if GCDWEBSERVER_USE_OPENSSL
+  if (_ssl) {
+    SSL_shutdown(_ssl);
+    SSL_free(_ssl);
+    _ssl = NULL;
   }
 #endif
 

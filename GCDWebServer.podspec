@@ -48,5 +48,14 @@ Pod::Spec.new do |s|
     cs.source_files = 'GCDWebUploader/*.{h,m}'
     cs.requires_arc = true
     cs.resource = "GCDWebUploader/GCDWebUploader.bundle"
-  end 
+  end
+
+  s.subspec 'TLS' do |cs|
+    cs.dependency 'GCDWebServer/Core'
+    cs.libraries = 'ssl', 'crypto'
+    cs.xcconfig = {
+      'HEADER_SEARCH_PATHS' => '"${PODS_ROOT}/../../ios-deps/openssl/include"',
+      'LIBRARY_SEARCH_PATHS' => '"${PODS_ROOT}/../../ios-deps/openssl/lib"'
+    }
+  end
 end
